@@ -116,6 +116,7 @@ class WatercareUsageSensor(SensorEntity):
         self._wastewater_ratio = wastewater_ratio
         self._annual_line_charge = annual_line_charge
         self._endpoint = endpoint
+        self._halfhourly_fallback_range = None
 
     @property
     def name(self):
@@ -189,26 +190,7 @@ class WatercareUsageSensor(SensorEntity):
         _LOGGER.debug(f"Beginning sensor update using endpoint: {self._endpoint}")
 
         if self._endpoint == "halfhourly":
-            # Watercare's current smart-meter API requires an explicit date range.
-            # Use complete Auckland calendar days, matching the mobile app's query
-            # shape and avoiding an incomplete current-day boundary.
-            today = datetime.now(NZ_TIMEZONE).date()
-            today_start = NZ_TIMEZONE.localize(
-                datetime.combine(today, datetime.min.time())
-            )
-            start_date = NZ_TIMEZONE.localize(
-                datetime.combine(today - timedelta(days=7), datetime.min.time())
-            )
-            end_date = today_start - timedelta(seconds=1)
-            response = await self._api.get_data(
-                endpoint=self._endpoint,
-                start_date=start_date.astimezone(pytz.utc).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                ),
-                end_date=end_date.astimezone(pytz.utc).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                ),
-            )
+            response = await self._fetch_halfhourly_data()
             await self.process_halfhourly_data(response)
             return
 
@@ -218,6 +200,77 @@ class WatercareUsageSensor(SensorEntity):
             await self.process_daily_data(response)
         else:
             await self.process_data(response)
+
+    async def _fetch_halfhourly_range(self, start_day, end_day):
+        """Fetch one Auckland calendar-day range; end_day is exclusive."""
+        start_date = NZ_TIMEZONE.localize(
+            datetime.combine(start_day, datetime.min.time())
+        )
+        end_date = (
+            NZ_TIMEZONE.localize(datetime.combine(end_day, datetime.min.time()))
+            - timedelta(seconds=1)
+        )
+        return await self._api.get_data(
+            endpoint=self._endpoint,
+            start_date=start_date.astimezone(pytz.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+            end_date=end_date.astimezone(pytz.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+        )
+
+    @staticmethod
+    def _is_empty_reading_list(response):
+        """Return whether Watercare returned a valid but empty reading list."""
+        if response is None:
+            return False
+        try:
+            readings = json.loads(response)
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return isinstance(readings, list) and not readings
+
+    async def _fetch_halfhourly_data(self):
+        """Find the newest half-hourly readings in bounded historical chunks."""
+        today = datetime.now(NZ_TIMEZONE).date()
+        recent_range = (today - timedelta(days=30), today)
+
+        response = await self._fetch_halfhourly_range(*recent_range)
+        if response is None or not self._is_empty_reading_list(response):
+            self._halfhourly_fallback_range = recent_range
+            return response
+
+        if self._halfhourly_fallback_range not in (None, recent_range):
+            response = await self._fetch_halfhourly_range(
+                *self._halfhourly_fallback_range
+            )
+            if response is None or not self._is_empty_reading_list(response):
+                return response
+
+        _LOGGER.warning(
+            "No recent Watercare readings; searching up to one year of "
+            "history in 30-day windows"
+        )
+        oldest_day = today - timedelta(days=365)
+        window_end = recent_range[0]
+
+        while window_end > oldest_day:
+            window_start = max(oldest_day, window_end - timedelta(days=30))
+            response = await self._fetch_halfhourly_range(window_start, window_end)
+            if response is None:
+                return None
+            if not self._is_empty_reading_list(response):
+                self._halfhourly_fallback_range = (window_start, window_end)
+                _LOGGER.warning(
+                    "Found Watercare readings in historical window %s to %s",
+                    window_start,
+                    window_end - timedelta(days=1),
+                )
+                return response
+            window_end = window_start
+
+        return "[]"
 
     async def process_halfhourly_data(self, response):
         """Process the current smart-meter half-hourly response."""
