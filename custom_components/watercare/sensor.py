@@ -190,14 +190,24 @@ class WatercareUsageSensor(SensorEntity):
 
         if self._endpoint == "halfhourly":
             # Watercare's current smart-meter API requires an explicit date range.
-            # Ninety days is comfortably below the observed API response limit and
-            # gives us enough data for useful rolling usage values.
-            end_date = datetime.now(pytz.utc)
-            start_date = end_date - timedelta(days=90)
+            # Use complete Auckland calendar days, matching the mobile app's query
+            # shape and avoiding an incomplete current-day boundary.
+            today = datetime.now(NZ_TIMEZONE).date()
+            today_start = NZ_TIMEZONE.localize(
+                datetime.combine(today, datetime.min.time())
+            )
+            start_date = NZ_TIMEZONE.localize(
+                datetime.combine(today - timedelta(days=7), datetime.min.time())
+            )
+            end_date = today_start - timedelta(seconds=1)
             response = await self._api.get_data(
                 endpoint=self._endpoint,
-                start_date=start_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                end_date=end_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                start_date=start_date.astimezone(pytz.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                end_date=end_date.astimezone(pytz.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
             )
             await self.process_halfhourly_data(response)
             return
