@@ -244,5 +244,10 @@ class WatercareApi:
                 _LOGGER.debug(f"API Response data length: {len(data) if data else 0}")
                 return data
             else:
-                _LOGGER.error(f"Could not fetch consumption: {response.status}")
+                response_text = await response.text()
+                _LOGGER.error(
+                    "Could not fetch consumption: %s, response: %s",
+                    response.status,
+                    response_text,
+                )
                 return None
