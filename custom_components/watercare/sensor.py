@@ -253,7 +253,17 @@ class WatercareUsageSensor(SensorEntity):
             parsed_readings.append((timestamp, litres))
 
         if not parsed_readings:
-            _LOGGER.warning("No valid half-hourly Watercare readings found")
+            if not readings:
+                _LOGGER.warning(
+                    "Watercare half-hourly API returned an empty list"
+                )
+            else:
+                _LOGGER.warning(
+                    "No valid half-hourly Watercare readings found. "
+                    "Returned %s items; first items: %s",
+                    len(readings),
+                    readings[:3],
+                )
             return
 
         parsed_readings.sort(key=lambda item: item[0])
