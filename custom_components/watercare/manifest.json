@@ -17,5 +17,5 @@
     "pytz",
     "voluptuous"
   ],
-  "version": "1.2.0b2"
+  "version": "1.2.0b3"
 }
