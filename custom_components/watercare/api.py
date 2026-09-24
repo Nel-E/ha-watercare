@@ -31,6 +31,7 @@ class WatercareApi:
         self._password = password
 
         self._accountNumber = None
+        self._meter_type = None
         self._token = None
         self._refresh_token = None
         self._refresh_token_expires_in = 0
@@ -182,7 +183,7 @@ class WatercareApi:
                     _LOGGER.error("Failed to retrieve the token page.")
 
     async def get_accounts(self):
-        """Get the first account that we see."""
+        """Select a smart-meter account when one is available."""
         headers = {"authorization": "Bearer " + (self._token or "")}
         jar = aiohttp.CookieJar(quote_cookie=False)
         async with (
@@ -191,11 +192,25 @@ class WatercareApi:
         ):
             if result.status == 200:
                 data = await result.json()
-                _LOGGER.debug(f"Accounts: {data}")
                 if data and isinstance(data, list) and len(data) > 0:
-                    self._accountNumber = data[0].get("accountNumber")
+                    selected_account = next(
+                        (
+                            account
+                            for account in data
+                            if str(account.get("meterType", "")).startswith(
+                                "smartmeter"
+                            )
+                        ),
+                        data[0],
+                    )
+                    self._accountNumber = selected_account.get("accountNumber")
+                    self._meter_type = selected_account.get("meterType", "unknown")
                     if self._accountNumber:
-                        _LOGGER.debug(f"AccountNumber: {self._accountNumber}")
+                        _LOGGER.warning(
+                            "Watercare selected meter type %s from %s account(s)",
+                            self._meter_type,
+                            len(data),
+                        )
                     else:
                         _LOGGER.error("Account number not found in the response")
                 else:
@@ -228,15 +243,22 @@ class WatercareApi:
         headers = {"authorization": "Bearer " + (self._token or "")}
 
         url = f"{self._url_base}v1/usage/{self._accountNumber}/{endpoint}"
+        params = None
         if start_date and end_date:
-            url += f"?from={start_date}&to={end_date}"
+            params = {"from": start_date, "to": end_date}
 
-        _LOGGER.debug(f"Calling API URL: {url}")
+        _LOGGER.warning(
+            "Watercare request: endpoint=%s, from=%s, to=%s, meter_type=%s",
+            endpoint,
+            start_date,
+            end_date,
+            self._meter_type,
+        )
 
         jar = aiohttp.CookieJar(quote_cookie=False)
         async with (
             aiohttp.ClientSession(cookie_jar=jar) as session,
-            session.get(url, headers=headers) as response,
+            session.get(url, headers=headers, params=params) as response,
         ):
             if response.status == 200:
                 data = await response.text()
@@ -246,8 +268,13 @@ class WatercareApi:
             else:
                 response_text = await response.text()
                 _LOGGER.error(
-                    "Could not fetch consumption: %s, response: %s",
+                    "Could not fetch consumption: %s, response: %s "
+                    "(endpoint=%s, from=%s, to=%s, meter_type=%s)",
                     response.status,
                     response_text,
+                    endpoint,
+                    start_date,
+                    end_date,
+                    self._meter_type,
                 )
                 return None
