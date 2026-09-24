@@ -187,14 +187,126 @@ class WatercareUsageSensor(SensorEntity):
     async def async_update(self):
         """Update the sensor data."""
         _LOGGER.debug(f"Beginning sensor update using endpoint: {self._endpoint}")
+
+        if self._endpoint == "halfhourly":
+            # Watercare's current smart-meter API requires an explicit date range.
+            # Ninety days is comfortably below the observed API response limit and
+            # gives us enough data for useful rolling usage values.
+            end_date = datetime.now(pytz.utc)
+            start_date = end_date - timedelta(days=90)
+            response = await self._api.get_data(
+                endpoint=self._endpoint,
+                start_date=start_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                end_date=end_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            )
+            await self.process_halfhourly_data(response)
+            return
+
         response = await self._api.get_data(endpoint=self._endpoint)
 
-        # Route to appropriate processing method based on endpoint
         if self._endpoint == "dailywithstats":
             await self.process_daily_data(response)
         else:
-            # For mechanicalmonthly, monthly, halfhourly - use the billing period processing
             await self.process_data(response)
+
+    async def process_halfhourly_data(self, response):
+        """Process the current smart-meter half-hourly response."""
+        if response is None:
+            _LOGGER.error(
+                "No response received from Watercare half-hourly API; skipping processing"
+            )
+            return
+
+        try:
+            readings = json.loads(response)
+        except (TypeError, json.JSONDecodeError) as err:
+            _LOGGER.error("Failed to parse Watercare half-hourly response: %s", err)
+            return
+
+        if not isinstance(readings, list):
+            _LOGGER.error(
+                "Unexpected Watercare half-hourly response type: %s",
+                type(readings).__name__,
+            )
+            return
+
+        parsed_readings = []
+        for reading in readings:
+            if not isinstance(reading, dict):
+                continue
+
+            timestamp_str = reading.get("timestamp")
+            if not timestamp_str:
+                continue
+
+            try:
+                timestamp = datetime.fromisoformat(
+                    timestamp_str.replace("Z", "+00:00")
+                ).astimezone(NZ_TIMEZONE)
+                litres = float(reading.get("litres", 0) or 0)
+            except (TypeError, ValueError) as err:
+                _LOGGER.warning(
+                    "Skipping invalid Watercare reading %s: %s", reading, err
+                )
+                continue
+
+            parsed_readings.append((timestamp, litres))
+
+        if not parsed_readings:
+            _LOGGER.warning("No valid half-hourly Watercare readings found")
+            return
+
+        parsed_readings.sort(key=lambda item: item[0])
+
+        now = datetime.now(NZ_TIMEZONE)
+        today = now.date()
+        yesterday = today - timedelta(days=1)
+        seven_days_ago = now - timedelta(days=7)
+        thirty_days_ago = now - timedelta(days=30)
+
+        today_litres = sum(
+            litres for timestamp, litres in parsed_readings if timestamp.date() == today
+        )
+        yesterday_litres = sum(
+            litres
+            for timestamp, litres in parsed_readings
+            if timestamp.date() == yesterday
+        )
+        seven_day_litres = sum(
+            litres for timestamp, litres in parsed_readings if timestamp >= seven_days_ago
+        )
+        thirty_day_litres = sum(
+            litres
+            for timestamp, litres in parsed_readings
+            if timestamp >= thirty_days_ago
+        )
+
+        latest_timestamp, latest_litres = parsed_readings[-1]
+
+        # This entity is a daily usage measurement. Do not mark it total_increasing,
+        # because it resets at midnight. Long-term cumulative statistics will be
+        # implemented separately once the new API behaviour is validated in HA.
+        self._state_class = "measurement"
+        self._state = round(today_litres, 3)
+        self._state_attributes = {
+            "today_litres": round(today_litres, 3),
+            "yesterday_litres": round(yesterday_litres, 3),
+            "last_30_min_litres": round(latest_litres, 3),
+            "last_reading": latest_timestamp.isoformat(),
+            "seven_day_litres": round(seven_day_litres, 3),
+            "thirty_day_litres": round(thirty_day_litres, 3),
+            "readings_returned": len(parsed_readings),
+            "range_start": parsed_readings[0][0].isoformat(),
+            "range_end": latest_timestamp.isoformat(),
+            "endpoint": self._endpoint,
+        }
+
+        _LOGGER.debug(
+            "Processed %s half-hourly readings; today=%s L, yesterday=%s L",
+            len(parsed_readings),
+            today_litres,
+            yesterday_litres,
+        )
 
     async def process_data(self, response):
         """Process the API response."""
